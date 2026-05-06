@@ -2,6 +2,7 @@
 
 use std::convert::TryInto;
 use std::os::raw::c_int;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use nix::sys::signal;
@@ -22,7 +23,7 @@ use crate::collector::Collector;
 use crate::error::{Error, Result};
 use crate::frames::UnresolvedFrames;
 use crate::report::ReportBuilder;
-use crate::timer::Timer;
+use crate::timer::{ThreadNameFilter, Timer};
 use crate::{MAX_DEPTH, MAX_THREAD_NAME};
 
 pub(crate) static PROFILER: Lazy<RwLock<Result<Profiler>>> =
@@ -61,6 +62,12 @@ pub struct ProfilerGuardBuilder {
         target_arch = "loongarch64"
     ))]
     blocklist_segments: Vec<(usize, usize)>,
+
+    /// Optional thread `comm` filter. When set, the profiler delivers
+    /// `SIGPROF` only to threads whose name matches the predicate. When
+    /// unset, the profiler installs a process-wide `setitimer(ITIMER_PROF)`
+    /// (legacy behaviour) and the kernel picks any on-CPU thread.
+    thread_name_filter: Option<ThreadNameFilter>,
 }
 
 impl Default for ProfilerGuardBuilder {
@@ -78,6 +85,8 @@ impl Default for ProfilerGuardBuilder {
                 target_arch = "loongarch64"
             ))]
             blocklist_segments: Vec::new(),
+
+            thread_name_filter: None,
         }
     }
 }
@@ -143,6 +152,32 @@ impl ProfilerGuardBuilder {
             ..self
         }
     }
+    /// Restrict `SIGPROF` delivery to threads whose `comm` (kernel thread
+    /// name as exposed at `/proc/<pid>/task/<tid>/comm`) is accepted by
+    /// `filter`.
+    ///
+    /// When set, the profiler swaps the default process-wide
+    /// `setitimer(ITIMER_PROF)` for a dedicated helper thread that uses
+    /// `tgkill` to deliver `SIGPROF` only to the threads accepted by
+    /// `filter`. This is the way to safely run `pprof-rs` inside a
+    /// process that embeds another stack-aware runtime such as the Go
+    /// runtime (via `cgo`), where signals delivered to runtime-owned
+    /// threads would otherwise corrupt their stacks and crash the
+    /// process.
+    ///
+    /// `filter` is invoked once per thread per sample tick, so it should
+    /// be cheap. A common pattern is to match against a known set of
+    /// runtime-owned thread name prefixes.
+    pub fn thread_name_filter<F>(self, filter: F) -> Self
+    where
+        F: Fn(&str) -> bool + Send + Sync + 'static,
+    {
+        Self {
+            thread_name_filter: Some(Arc::new(filter)),
+            ..self
+        }
+    }
+
     pub fn build(self) -> Result<ProfilerGuard<'static>> {
         trigger_lazy();
 
@@ -168,10 +203,18 @@ impl ProfilerGuardBuilder {
                 }
 
                 match profiler.start() {
-                    Ok(()) => Ok(ProfilerGuard::<'static> {
-                        profiler: &PROFILER,
-                        timer: Some(Timer::new(self.frequency)),
-                    }),
+                    Ok(()) => {
+                        let timer = match self.thread_name_filter {
+                            Some(filter) => {
+                                Timer::with_thread_name_filter(self.frequency, filter)
+                            }
+                            None => Timer::new(self.frequency),
+                        };
+                        Ok(ProfilerGuard::<'static> {
+                            profiler: &PROFILER,
+                            timer: Some(timer),
+                        })
+                    }
                     Err(err) => Err(err),
                 }
             }
