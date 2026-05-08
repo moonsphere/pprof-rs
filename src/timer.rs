@@ -32,6 +32,13 @@ type c_long = isize;
 
 const ITIMER_PROF: c_int = 2;
 const SIGPROF: c_int = 27;
+/// Signal used by the `Tgkill` delivery mode. Distinct from `SIGPROF` so
+/// that an embedded Go runtime in the same process can keep using
+/// `setitimer(ITIMER_PROF)`-driven `SIGPROF` for its own pprof without
+/// conflicting with this profiler. Go's runtime never installs a handler
+/// for `SIGUSR2`, so signals delivered here are seen exclusively by
+/// `pprof-rs`'s `perf_signal_handler`.
+const SIGUSR2: c_int = 12;
 
 // `tgkill` syscall number per architecture.
 #[cfg(target_arch = "x86_64")]
@@ -178,7 +185,7 @@ impl Timer {
                         // thread may have exited between enumeration and
                         // delivery.
                         unsafe {
-                            syscall(SYS_TGKILL, pid as c_long, tid as c_long, SIGPROF as c_long);
+                            syscall(SYS_TGKILL, pid as c_long, tid as c_long, SIGUSR2 as c_long);
                         }
                     }
                     thread::sleep(interval);
@@ -194,6 +201,18 @@ impl Timer {
                 stop,
                 handle: Some(handle),
             },
+        }
+    }
+
+    /// Returns the signal number this timer delivers. The profiler installs
+    /// its `sigaction` handler on this signal. `Itimer` mode is bound to
+    /// `SIGPROF` by `setitimer(ITIMER_PROF)`; `Tgkill` mode uses `SIGUSR2`
+    /// so that a Go runtime sharing the process can continue to drive its
+    /// own pprof on `SIGPROF`.
+    pub fn signal(&self) -> c_int {
+        match self.mode {
+            TimerMode::Itimer => SIGPROF,
+            TimerMode::Tgkill { .. } => SIGUSR2,
         }
     }
 

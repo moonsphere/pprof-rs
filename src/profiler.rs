@@ -34,6 +34,10 @@ pub struct Profiler {
     sample_counter: i32,
 
     old_sigaction: Option<signal::SigAction>,
+    /// Signal the profiler's `sigaction` is installed on. `SIGPROF` for the
+    /// legacy `setitimer` path; `SIGUSR2` when the timer drives delivery via
+    /// `tgkill` so that an embedded Go runtime can keep `SIGPROF` for itself.
+    signal: signal::Signal,
     running: bool,
 
     #[cfg(feature = "frame-pointer")]
@@ -202,7 +206,16 @@ impl ProfilerGuardBuilder {
                     profiler.blocklist_segments = self.blocklist_segments;
                 }
 
-                match profiler.start() {
+                // Pick the signal up-front: tgkill mode uses SIGUSR2, the
+                // legacy setitimer path uses SIGPROF. Profiler installs its
+                // sigaction on this signal so the Go runtime sharing the
+                // process can keep SIGPROF for its own pprof.
+                let signal = if self.thread_name_filter.is_some() {
+                    signal::SIGUSR2
+                } else {
+                    signal::SIGPROF
+                };
+                match profiler.start_with_signal(signal) {
                     Ok(()) => {
                         let timer = match self.thread_name_filter {
                             Some(filter) => {
@@ -463,6 +476,7 @@ impl Profiler {
             data: Collector::new()?,
             sample_counter: 0,
             old_sigaction: None,
+            signal: signal::SIGPROF,
             running: false,
 
             #[cfg(feature = "frame-pointer")]
@@ -496,10 +510,19 @@ impl Profiler {
 
 impl Profiler {
     pub fn start(&mut self) -> Result<()> {
-        log::info!("starting cpu profiler");
+        self.start_with_signal(signal::SIGPROF)
+    }
+
+    /// Start the profiler with an explicit signal. Used by
+    /// `ProfilerGuardBuilder::build` to pick `SIGUSR2` when the timer is
+    /// configured with a `thread_name_filter` so that the profiler does not
+    /// share `SIGPROF` with an embedded Go runtime.
+    pub fn start_with_signal(&mut self, signal: signal::Signal) -> Result<()> {
+        log::info!("starting cpu profiler on signal {:?}", signal);
         if self.running {
             Err(Error::Running)
         } else {
+            self.signal = signal;
             self.register_signal_handler()?;
             self.running = true;
 
@@ -542,14 +565,14 @@ impl Profiler {
             flags
         };
         let sigaction = signal::SigAction::new(handler, flags, signal::SigSet::empty());
-        let old_action = unsafe { signal::sigaction(signal::SIGPROF, &sigaction) }?;
+        let old_action = unsafe { signal::sigaction(self.signal, &sigaction) }?;
         self.old_sigaction = Some(old_action);
         Ok(())
     }
 
     fn unregister_signal_handler(&mut self) -> Result<()> {
         if let Some(old_action) = self.old_sigaction.take() {
-            unsafe { signal::sigaction(signal::SIGPROF, &old_action) }?;
+            unsafe { signal::sigaction(self.signal, &old_action) }?;
         }
         Ok(())
     }
